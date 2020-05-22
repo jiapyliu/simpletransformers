@@ -41,6 +41,9 @@ from torch.utils.data.distributed import DistributedSampler
 from transformers import (
     WEIGHTS_NAME,
     AdamW,
+    AutoConfig,
+    AutoTokenizer,
+    AutoModelWithLMHead,
     BertConfig,
     BertForMaskedLM,
     BertTokenizer,
@@ -67,6 +70,9 @@ from transformers import (
     RobertaTokenizer,
     get_linear_schedule_with_warmup,
 )
+# for using TPU
+import torch_xla
+import torch_xla.core.xla_model as xm
 
 try:
     import wandb
@@ -78,13 +84,14 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 MODEL_CLASSES = {
+    "auto": (AutoConfig, AutoModelWithLMHead, AutoTokenizer),
+    "bert": (BertConfig, BertForMaskedLM, BertTokenizer),
+    "camembert": (CamembertConfig, CamembertForMaskedLM, CamembertTokenizer),
+    "distilbert": (DistilBertConfig, DistilBertForMaskedLM, DistilBertTokenizer),
+    "electra": (ElectraConfig, ElectraForLanguageModelingModel, ElectraTokenizer),
     "gpt2": (GPT2Config, GPT2LMHeadModel, GPT2Tokenizer),
     "openai-gpt": (OpenAIGPTConfig, OpenAIGPTLMHeadModel, OpenAIGPTTokenizer),
-    "bert": (BertConfig, BertForMaskedLM, BertTokenizer),
     "roberta": (RobertaConfig, RobertaForMaskedLM, RobertaTokenizer),
-    "distilbert": (DistilBertConfig, DistilBertForMaskedLM, DistilBertTokenizer),
-    "camembert": (CamembertConfig, CamembertForMaskedLM, CamembertTokenizer),
-    "electra": (ElectraConfig, ElectraForLanguageModelingModel, ElectraTokenizer),
 }
 
 
@@ -124,8 +131,13 @@ class LanguageModelingModel:
             if "n_gpu" in args and args["n_gpu"] > 0:
                 torch.cuda.manual_seed_all(args["manual_seed"])
 
-        if use_cuda:
+        # to use this add "use_tpu": True to  train_args 
+        if args['use_tpu']:
+            print('using TPU')
+            self.device = xm.xla_device()
+        elif use_cuda:
             if torch.cuda.is_available():
+                print('using GPU')
                 if cuda_device == -1:
                     self.device = torch.device("cuda")
                 else:
@@ -136,6 +148,7 @@ class LanguageModelingModel:
                     " Make sure CUDA is available or set use_cuda=False."
                 )
         else:
+            print('using CPU')
             self.device = "cpu"
 
         self.results = {}
@@ -160,6 +173,13 @@ class LanguageModelingModel:
         }
 
         self.args.update(global_args)
+
+        saved_model_args = self._load_model_args(model_name)
+        if saved_model_args:
+            self.args.update(saved_model_args)
+
+        if args:
+            self.args.update(args)
 
         if not use_cuda:
             self.args["fp16"] = False
@@ -508,7 +528,11 @@ class LanguageModelingModel:
                     else:
                         torch.nn.utils.clip_grad_norm_(model.parameters(), args["max_grad_norm"])
 
-                    optimizer.step()
+                   # Update parameters and take a step using the computed gradient
+                    if args['use_tpu']:
+                        xm.optimizer_step(optimizer, barrier=True)
+                    else: 
+                        optimizer.step()
                     scheduler.step()  # Update learning rate schedule
                     model.zero_grad()
                     global_step += 1
@@ -1080,9 +1104,25 @@ class LanguageModelingModel:
                 torch.save(optimizer.state_dict(), os.path.join(output_dir, "optimizer.pt"))
             if scheduler:
                 torch.save(scheduler.state_dict(), os.path.join(output_dir, "scheduler.pt"))
+            self._save_model_args(output_dir)
 
         if results:
             output_eval_file = os.path.join(output_dir, "eval_results.txt")
             with open(output_eval_file, "w") as writer:
                 for key in sorted(results.keys()):
                     writer.write("{} = {}\n".format(key, str(results[key])))
+
+    def _save_model_args(self, output_dir):
+        os.makedirs(output_dir, exist_ok=True)
+        with open(os.path.join(output_dir, "model_args.json"), "w") as f:
+            json.dump(self.args, f)
+
+    def _load_model_args(self, input_dir):
+        if input_dir:
+            input_dir, filename = os.path.split(input_dir)
+
+            model_args_file = os.path.join(input_dir, "model_args.json")
+            if os.path.isfile(model_args_file):
+                with open(model_args_file, "r") as f:
+                    model_args = json.load(f)
+                return model_args
